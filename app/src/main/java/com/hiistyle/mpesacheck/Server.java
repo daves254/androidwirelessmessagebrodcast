@@ -1,13 +1,24 @@
 package com.hiistyle.mpesacheck;
 
+import android.app.Activity;
+import android.app.Service;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.util.Log;
+import android.view.View;
+import android.widget.TextView;
+import android.widget.Toast;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.LifecycleObserver;
+import androidx.lifecycle.LifecycleOwner;
+import androidx.lifecycle.MutableLiveData;
+import androidx.lifecycle.Observer;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -29,6 +40,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -37,6 +49,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 class Server implements Runnable {
+enum Status{
+    NotStarted,Waiting,Connected, Retrying, Disconnected
+}
+    final MutableLiveData<AccessPoint> ap_bind = new MutableLiveData<>();
 
     static class User {
         String currentAuthorizationToken;
@@ -52,34 +68,44 @@ class Server implements Runnable {
         user.password = "1101101001";
         users.put("admin", user);
     }
-    private int device;
-    private ServerSocket serverSocket;
-    private final Context ctx;
+    final MutableLiveData<Status> status=new MutableLiveData<>(Status.Disconnected);
+    private boolean started;
+    public final MutableLiveData<Socket> socket_ = new MutableLiveData<>();
     private HashMap<String, Socket> sessions = new HashMap<>();
-    MainActivity activity;
-public Server(Context ctx){
-    this.ctx=ctx;
-}
-    public void selectDevice(int i) {
-        this.device = i;
+    Context ctx;
+
+    public Server(CoreServer coreService) {
+        this.ctx = coreService;
+        ap_bind.observe(coreService, new Observer<AccessPoint>() {
+            @Override
+            public void onChanged(AccessPoint accessPoint) {
+                if (accessPoint != null)
+                    new Thread(() -> {
+                        try {
+                            CoreServer.BIND.getValue().server.socket_.postValue(new Socket(ap_bind.getValue().address, ap_bind.getValue().port));
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }).start();
+            }
+        });
     }
 
-    public void setPort(int port) throws IOException {
-        this.serverSocket = new ServerSocket(port, 0, accessPoints[device].address);
+    public void accessPoint(AccessPoint ap) {
+        this.ap_bind.postValue(ap);
     }
-
 
 
     public void stop() {
-        if (serverSocket != null) {
-            if (!serverSocket.isClosed()) {
+        if (socket_.getValue() != null) {
+            if (!socket_.getValue().isClosed()) {
                 try {
-                    serverSocket.close();
+                    socket_.getValue().close();
                 } catch (Exception err) {
                     // Swallow the error!
                 }
             }
-            serverSocket = null;
+            socket_.postValue(null);
         }
     }
 
@@ -140,7 +166,7 @@ public Server(Context ctx){
         }
 
         private void response(String response) throws IOException {
-            os.write(("response:"+response).getBytes());
+            os.write(("response:" + response).getBytes());
             endl();
         }
 
@@ -167,17 +193,15 @@ public Server(Context ctx){
 
     static class AccessPoint {
         int port;
+        String address;
         String name;
-        Inet4Address address;
 
         @Override
         public String toString() {
-            return name;
+            return address + ":" + port;
         }
     }
 
-    static final AccessPoint[] EMPTY_ACCESS_POINT = {};
-    AccessPoint[] accessPoints = EMPTY_ACCESS_POINT;
     static final Pattern KEY_VALUE_PATTERN = Pattern.compile("(?<key>[A-Za-z0-9= /\\-]+):(?<value>[A-Za-z0-9= /\\-]+)");
     static final Gson gson = new GsonBuilder().create();
 
@@ -219,26 +243,46 @@ public Server(Context ctx){
     @RequiresApi(api = Build.VERSION_CODES.O)
     @Override
     public void run() {
-        while(activity==null||serverSocket==null){
-            try {
+        int[] trials = {0};
+        status.postValue(Status.Waiting);
 
+        while (listen(trials)) {
+            AccessPoint ap = ap_bind.getValue();
+            if (trials[0] >= 1000) {
+                status.postValue(Status.Disconnected);
+                ap_bind.postValue(null);
+                trials[0] = 0;
+            } else if (ap != null) {
+                status.postValue(Status.Retrying);
+                trials[0]++;
+                ap_bind.postValue(ap);
+            }else {
+                status.postValue(Status.Disconnected);
+                trials[0]=0;
+            }
+
+
+        }
+        status.postValue(Status.Disconnected);
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    private boolean listen(int[] trials) {
+        while (socket_.getValue() == null) {
+            try {
                 Thread.sleep(1000);
             } catch (InterruptedException e) {
-                return;
+                return false;
             }
         }
 
-        LISTEN:
-        while (true) {
-            Socket s = null;
-            try {
-                s = serverSocket.accept();
-            } catch (IOException e) {
-                if (serverSocket.isClosed()) break LISTEN;
-                continue;
-            }
+        {
+            Socket s = socket_.getValue();
+            if(s.isClosed())return true;
             try {
                 InputStream in = s.getInputStream();
+                //
+                status.postValue(Status.Connected);
                 ResponseChannel responseChannel;
                 {
                     OutputStream os = s.getOutputStream();
@@ -266,7 +310,6 @@ public Server(Context ctx){
                         if (offset >= len) {
                             continue CONNECTION;
                         }
-                        System.out.println("GORE:" + iter);
                         int eolIndx = -1;
                         for (; offset < len; offset++) {
                                 /*if (buffer[offset] < 0) {
@@ -290,7 +333,7 @@ public Server(Context ctx){
                             continue READING;
                         }
                         String header = sb.toString().trim();
-                        System.out.println("HEADER: "+header);
+                        System.out.println("HEADER: " + header);
                         sb.delete(0, sb.length());
 
                         Matcher m;
@@ -346,7 +389,7 @@ public Server(Context ctx){
                                             //Disconnect
                                             s.close();
                                             map.clear();
-                                            continue LISTEN;
+                                            return true;
                                         }
                                     }
                                     map.clear();
@@ -446,7 +489,7 @@ public Server(Context ctx){
                                                     }
                                                     break;
                                                     default: {
-                                                        responseChannel.sendException(new NoSuchElementException("Command isn't found:"+access.type));
+                                                        responseChannel.sendException(new NoSuchElementException("Command isn't found:" + access.type));
                                                         break;
                                                     }
                                                 }
@@ -489,9 +532,9 @@ public Server(Context ctx){
                 e.printStackTrace();
             }
         }
-        if(activity!=null){
-            //activity.isStopped=true;
-        }
+        socket_.postValue(null);
+        trials[0] = 0;
+        return true;
     }
 
     private Object authorize(String username, String password, Socket s) {
@@ -542,11 +585,8 @@ public Server(Context ctx){
         return socket == s;
     }
 
-    public Object init(Context ctx) {
+    public Object init() {
         {
-            accessPoints = EMPTY_ACCESS_POINT;
-            StringBuilder sb = new StringBuilder();
-            ArrayList<AccessPoint> accessPoints = new ArrayList<>();
             try {
                 Enumeration<NetworkInterface> net_interfaces = NetworkInterface.getNetworkInterfaces();
                 for (; net_interfaces.hasMoreElements(); ) {
@@ -558,40 +598,20 @@ public Server(Context ctx){
                         boolean wifi = interfaceName.matches("wlan\\d.*");
                         boolean hotspot = interfaceName.matches("ap\\d.*");
                         if (wifi || hotspot) {
-                            sb.append("(name: ");
-                            sb.append(interfaceName);
-                            sb.append(", display_name: ").append(e.getDisplayName());
-                            sb.append("){");
-                            boolean r0 = false;
-                            Log.i("#", wifi ? "isWifi:true" : "isWifi:false");
-                            Log.i("#", hotspot ? "isHotspot:true" : "isHotspot:false");
-                            Log.i("#", interfaceName);
-
                             for (; ips.hasMoreElements(); ) {
                                 InetAddress ip = ips.nextElement();
                                 if (!ip.isLoopbackAddress() && (ip instanceof Inet4Address)) {
-                                    if (r0) sb.append(", ");
-                                    AccessPoint ap = new AccessPoint();
-                                    ap.address = (Inet4Address) ip;
-                                    ap.name = (wifi ? "Wi-Fi" : "Hotspot") + " (" + interfaceName + ")";
-                                    accessPoints.add(ap);
-                                    sb.append(ap.address);
-                                    r0 = true;
+                                    return true;
                                 }
                             }
                         }
-
-                        sb.append("}");
-                        sb.append(System.lineSeparator());
                     }
                 }
             } catch (Throwable e) {
                 e.printStackTrace();
                 return e;
             }
-            Log.i("NETWORK_INFO", sb.toString());
-            this.accessPoints = !accessPoints.isEmpty() ? accessPoints.toArray(EMPTY_ACCESS_POINT) : EMPTY_ACCESS_POINT;
-            return this.accessPoints.length != 0;
+            return false;
         }
 
     }

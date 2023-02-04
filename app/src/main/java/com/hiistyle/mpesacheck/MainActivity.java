@@ -22,15 +22,20 @@ import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
+import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.lifecycle.Observer;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.TypeAdapter;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import com.google.zxing.integration.android.IntentIntegrator;
+import com.google.zxing.integration.android.IntentResult;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -58,28 +63,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class MainActivity extends AppCompatActivity {
-    CoreServer serverService;
-    class ServerConnection implements ServiceConnection {
-        @Override
-        public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
-            serverService=((CoreServerBinder)iBinder).getServer();
-            if(serverService.server==null){
-                serverService.server=new Server(MainActivity.this);
-            }
-            findViewById(R.id.button).setEnabled(true);
-            ((TextView)findViewById(R.id.status)).setText("Service connected");
-            serverService.server.activity=MainActivity.this;
-        }
-
-        @Override
-        public void onServiceDisconnected(ComponentName componentName) {
-            serverService=null;
-
-        }
-    }
     @RequiresApi(api = Build.VERSION_CODES.M)
     public void onConnectClicked(View v) {
-        if(serverService==null){
+        if (CoreServer.BIND.getValue() == null) {
             v.setEnabled(false);
             startServerService();
             return;
@@ -94,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
                     Manifest.permission.ACCESS_NETWORK_STATE,
                     Manifest.permission.RECEIVE_SMS,
                     Manifest.permission.SEND_SMS,
+                    Manifest.permission.CAMERA,
                     Manifest.permission.ACCESS_BACKGROUND_LOCATION,
                     Manifest.permission.ACCESS_LOCATION_EXTRA_COMMANDS,
                     Manifest.permission.ACCESS_COARSE_LOCATION,
@@ -110,51 +97,14 @@ public class MainActivity extends AppCompatActivity {
                     }
             }
 
-            Object ret = serverService.server.init(this);
+            Object ret = CoreServer.BIND.getValue().server.init();
             if (ret instanceof Boolean) {
                 Boolean b = (Boolean) ret;
                 if (b.booleanValue()) {
-                    Spinner spinner = findViewById(R.id.device);
-                    ArrayAdapter<Server.AccessPoint> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, serverService.server.accessPoints);
-                    spinner.setAdapter(adapter);
-                    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-
-                    spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-
-                        @Override
-                        public void onItemSelected(AdapterView<?> adapterView, View view, int i, long l) {
-                            Server.AccessPoint point = (Server.AccessPoint) adapterView.getItemAtPosition(i);
-                            TextView tv = findViewById(R.id.host);
-                            tv.setText(point.address.getHostAddress());
-                            ((Button) v).setText("Connect");
-                            v.setOnClickListener(new View.OnClickListener() {
-                                @Override
-                                public void onClick(View view) {
-                                    serverService.server.selectDevice(i);
-                                    try {
-                                        serverService.server.setPort(Integer.parseInt(((TextView) findViewById(R.id.port)).getText().toString()));
-                                        ((Button) v).setText("Disconnect");
-                                        v.setOnClickListener(new View.OnClickListener() {
-                                            @Override
-                                            public void onClick(View view) {
-                                                serverService.server.stop();
-                                                System.exit(0);
-                                            }
-                                        });
-                                    } catch (IOException e) {
-                                        e.printStackTrace();
-                                    }
-                                }
-                            });
-                        }
-
-                        @Override
-                        public void onNothingSelected(AdapterView<?> adapterView) {
-                        }
-                    });
                     // v.setTextAlignment();
+                    connect(v);
                 } else {
-                    new AlertDialog.Builder(this).setTitle("Not connected").setMessage("Please connect to wifi").show();
+                    new AlertDialog.Builder(this).setTitle("Not connected").setMessage("Please connect to wifi or start hostpot.").show();
                     return;
                 }
             } else new AlertDialog.Builder(this).setTitle("Error").setMessage(ret + "").show();
@@ -163,19 +113,123 @@ public class MainActivity extends AppCompatActivity {
         } catch (Throwable e) {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             e.printStackTrace(new PrintStream(baos));
-            new AlertDialog.Builder(this).setTitle("Error").setMessage(new String(baos.toByteArray())).show();
+            new AlertDialog.Builder(this).setTitle("Error").setMessage(baos.toString()).show();
         }
     }
+
+    public void connect(View v) {
+        // we need to create the object
+        // of IntentIntegrator class
+        // which is the class of QR library
+        IntentIntegrator intentIntegrator = new IntentIntegrator(this);
+        intentIntegrator.setPrompt("Scan a barcode or QR Code");
+        intentIntegrator.setCaptureActivity(QRScannerActivity.class);
+        intentIntegrator.setOrientationLocked(false);
+        intentIntegrator.setBeepEnabled(true);
+        intentIntegrator.initiateScan();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        IntentResult intentResult = IntentIntegrator.parseActivityResult(requestCode, resultCode, data);
+        // if the intentResult is null then
+        // toast a message as "cancelled"
+        if (intentResult != null) {
+            String contents = intentResult.getContents();
+            if (contents == null) {
+                Toast.makeText(getBaseContext(), "Cancelled", Toast.LENGTH_SHORT).show();
+            } else {
+                // if the intentResult is not null we'll set
+                // the content and format of scan message
+                //messageText.setText(intentResult.getContents());
+                //messageFormat.setText(intentResult.getFormatName());
+         /*       String r = intentResult.getContents();
+                new AlertDialog//
+                        .Builder(this)//
+                        .setTitle(//
+                                intentResult//
+                                        .getFormatName()//
+                        ).setMessage(r)//
+                        .show();*/
+                Server.AccessPoint[] ap = {null};
+                if ("QR_CODE".equals(intentResult.getFormatName())) {
+                    try {
+                        System.out.println(contents);
+                        ap[0] = new Gson().fromJson(contents, Server.AccessPoint.class);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+                if (ap[0] != null) {
+                    {
+                        System.out.println(new Gson().toJson(ap));
+                        CoreServer.BIND.getValue().server.accessPoint(ap[0]);
+                    }
+                }
+
+
+            }
+        } else {
+            super.onActivityResult(requestCode, resultCode, data);
+        }
+    }
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        CoreServer.BIND.observe(this, new Observer<CoreServer>() {
+            @Override
+            public void onChanged(CoreServer coreServer) {
+                if (coreServer != null) {
+                    ((Button)findViewById(R.id.button)).setEnabled(true);
+                    CoreServer.BIND.getValue().server.status.observe(MainActivity.this,new Observer<Server.Status>(){
+                        /**
+                         * Called when the data is changed.
+                         *
+                         * @param status The new data
+                         */
+                        @Override
+                        public void onChanged(Server.Status status) {
+                            if(status!=null) {
+                                TextView statusView = (TextView) findViewById(R.id.status);
+                                switch (status){
+    
+                                    case NotStarted:
+                                        statusView.setText("Not started");
+                                        findViewById(R.id.button).setEnabled(true);
+                                        break;
+                                    case Waiting:
+                                        statusView.setText("Waiting Connection");
+                                        findViewById(R.id.button).setEnabled(true);
+                                        break;
+                                    case Connected:
+                                        statusView.setText("Connected");
+                                        findViewById(R.id.button).setEnabled(false);
+                                        break;
+                                    case Retrying:
+                                        statusView.setText("Retrying...");
+                                        findViewById(R.id.button).setEnabled(true);
+                                        break;
+                                    case Disconnected:
+                                        statusView.setText("Disconnected");
+                                        findViewById(R.id.button).setEnabled(true);
+                                        break;
+                                }
+                            }
+                        }
+                    });
+                    CoreServer.BIND.getValue().server.status.postValue(Server.Status.NotStarted);
+                }
+            }
+        });
         startServerService();
-    }
+          }
 
     private void startServerService() {
-        Intent intent=new Intent(this,CoreServer.class);
-        bindService(intent,new ServerConnection(),Context.BIND_AUTO_CREATE);
+        Intent intent = new Intent(this, CoreServer.class);
+        startService(intent);
     }
 }
